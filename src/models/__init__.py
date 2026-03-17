@@ -24,7 +24,11 @@ class BackendConfig:
     precision: str = "bfloat16"
     device_map: str = "auto"
     use_flash_attention_2: bool = True
+    torch_compile: bool = False
     trust_remote_code: bool = True
+    image_resize: Optional[float] = None
+    max_image_num: Optional[int] = None
+    force_textual_fallback: bool = False
 
 
 class BaseVLMBackend(ABC):
@@ -95,4 +99,3 @@ def build_backend(backend_name: str, config: BackendConfig) -> BaseVLMBackend:
         f"Unsupported backend '{backend_name}'. "
         "Implement a BaseVLMBackend adapter and register it in build_backend()."
     )
-

@@ -52,6 +52,9 @@ class QwenNSSMWrapper(BaseVLMBackend):
     def __init__(self, config: BackendConfig) -> None:
         self.config = config
         self.dtype = _precision_to_dtype(config.precision)
+        self.image_resize = config.image_resize
+        self.max_image_num = config.max_image_num
+        self.force_textual_fallback = config.force_textual_fallback
 
         model_id = self._resolve_model_id(
             model_local_path=config.model_local_path,
@@ -89,6 +92,13 @@ class QwenNSSMWrapper(BaseVLMBackend):
                 model_id,
                 **model_kwargs,
             )
+
+        if config.torch_compile:
+            try:
+                self.model = torch.compile(self.model)
+                LOGGER.info("Enabled torch.compile for Qwen backend.")
+            except Exception as exc:  # pragma: no cover - runtime fallback
+                LOGGER.warning("torch.compile failed for Qwen backend: %s", exc)
 
         self.model.eval()
 
@@ -139,6 +149,8 @@ class QwenNSSMWrapper(BaseVLMBackend):
                 images.append(media_inputs["image"])
             if "video" in media_inputs:
                 videos.append(media_inputs["video"])
+            if self.max_image_num is not None and self.max_image_num >= 0:
+                images = images[: self.max_image_num]
             return images, videos
 
         raise TypeError(
@@ -148,11 +160,17 @@ class QwenNSSMWrapper(BaseVLMBackend):
 
     def _read_image(self, item: Union[str, Path, Image.Image]) -> Image.Image:
         if isinstance(item, Image.Image):
-            return item.convert("RGB")
-        path = Path(item)
-        if not path.exists():
-            raise FileNotFoundError(f"Image file not found: {path}")
-        return Image.open(path).convert("RGB")
+            image = item.convert("RGB")
+        else:
+            path = Path(item)
+            if not path.exists():
+                raise FileNotFoundError(f"Image file not found: {path}")
+            image = Image.open(path).convert("RGB")
+        if self.image_resize is not None and self.image_resize > 0 and self.image_resize != 1.0:
+            width = max(1, int(round(image.width * self.image_resize)))
+            height = max(1, int(round(image.height * self.image_resize)))
+            image = image.resize((width, height), Image.LANCZOS)
+        return image
 
     def _build_messages(
         self,
@@ -394,34 +412,36 @@ class QwenNSSMWrapper(BaseVLMBackend):
                 top_p=top_p,
             )
 
-        try:
-            return self._generate_with_slot_prefix_embeddings(
-                prompt=prompt,
-                selected_slots=selected_slots,
-                max_new_tokens=max_new_tokens,
-                temperature=temperature,
-                top_p=top_p,
-            )
-        except Exception as exc:  # pragma: no cover - fallback path for portability.
-            LOGGER.warning(
-                "Slot-prefix embedding generation failed (%s). "
-                "Falling back to textual memory prompt.",
-                exc,
-            )
-            memory_text = self._render_textual_slot_memory(
-                slot_names=slot_names,
-                selected_slots=selected_slots,
-            )
-            enriched_prompt = (
-                f"{memory_text}\n\n"
-                f"[User Question]\n{prompt}\n\n"
-                "Answer based only on the routed memory slots."
-            )
-            return self.generate(
-                prompt=enriched_prompt,
-                media_inputs=None,
-                max_new_tokens=max_new_tokens,
-                temperature=temperature,
-                top_p=top_p,
-            )
-
+        if not self.force_textual_fallback:
+            try:
+                return self._generate_with_slot_prefix_embeddings(
+                    prompt=prompt,
+                    selected_slots=selected_slots,
+                    max_new_tokens=max_new_tokens,
+                    temperature=temperature,
+                    top_p=top_p,
+                )
+            except Exception as exc:  # pragma: no cover - fallback path for portability.
+                LOGGER.warning(
+                    "Slot-prefix embedding generation failed (%s). "
+                    "Falling back to textual memory prompt.",
+                    exc,
+                )
+        else:
+            LOGGER.info("Skipping slot-prefix embeddings and forcing textual fallback.")
+        memory_text = self._render_textual_slot_memory(
+            slot_names=slot_names,
+            selected_slots=selected_slots,
+        )
+        enriched_prompt = (
+            f"{memory_text}\n\n"
+            f"[User Question]\n{prompt}\n\n"
+            "Answer based only on the routed memory slots."
+        )
+        return self.generate(
+            prompt=enriched_prompt,
+            media_inputs=None,
+            max_new_tokens=max_new_tokens,
+            temperature=temperature,
+            top_p=top_p,
+        )

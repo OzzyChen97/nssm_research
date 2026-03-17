@@ -34,6 +34,7 @@ from src.eval.metrics import (
     reset_peak_vram_stats,
 )
 from src.eval.mmlongbench_loader import load_mmlongbench_samples
+from src.eval.output_sanitizer import sanitize_answer
 from src.models import BackendConfig, build_backend
 from src.models.dynamic_slot_attn import QueryAwareSlotAggregator
 from src.pipeline.memory_router import NameAwareMemoryRouter
@@ -81,7 +82,19 @@ class NSSMSystem:
             precision=str(model_cfg.get("precision", "bfloat16")),
             device_map=str(model_cfg.get("device_map", "auto")),
             use_flash_attention_2=bool(model_cfg.get("use_flash_attention_2", True)),
+            torch_compile=bool(model_cfg.get("torch_compile", False)),
             trust_remote_code=bool(model_cfg.get("trust_remote_code", True)),
+            image_resize=(
+                float(model_cfg.get("image_resize"))
+                if model_cfg.get("image_resize") is not None
+                else None
+            ),
+            max_image_num=(
+                int(model_cfg.get("max_image_num"))
+                if model_cfg.get("max_image_num") is not None
+                else None
+            ),
+            force_textual_fallback=bool(model_cfg.get("force_textual_fallback", False)),
         )
         backend_name = str(model_cfg.get("backend", "qwen"))
         self.backend = build_backend(backend_name=backend_name, config=backend_config)
@@ -98,6 +111,7 @@ class NSSMSystem:
             alpha_text_name=self.hparams.routing_alpha_text_name,
         )
         self._aggregator_ready = False
+        self._compile_aggregator = bool(model_cfg.get("compile_aggregator", False))
 
         LOGGER.info(
             "Initialized NSSM with backend=%s, slots=%d, top_k=%d",
@@ -113,6 +127,12 @@ class NSSMSystem:
             device=reference_tensor.device,
             dtype=reference_tensor.dtype,
         )
+        if self._compile_aggregator:
+            try:
+                self.aggregator = torch.compile(self.aggregator)
+                LOGGER.info("Enabled torch.compile for NSSM aggregator.")
+            except Exception as exc:  # pragma: no cover - runtime fallback
+                LOGGER.warning("torch.compile failed for NSSM aggregator: %s", exc)
         self.aggregator.eval()
         self._aggregator_ready = True
 
@@ -141,6 +161,44 @@ class NSSMSystem:
         if base_visual_tokens.size(1) > self.hparams.max_visual_tokens_raw:
             base_visual_tokens = base_visual_tokens[:, : self.hparams.max_visual_tokens_raw, :]
         stage_latency_ms["step1_perception"] = (time.perf_counter() - t0) * 1000.0
+
+        generation_cfg = self.config.get("generation", {})
+        if base_visual_tokens.size(1) == 0:
+            t0 = time.perf_counter()
+            raw_answer = self.backend.generate(
+                prompt=prompt,
+                media_inputs=None,
+                max_new_tokens=int(generation_cfg.get("max_new_tokens", 256)),
+                temperature=float(generation_cfg.get("temperature", 0.0)),
+                top_p=float(generation_cfg.get("top_p", 1.0)),
+            )
+            stage_latency_ms["step2_dynamic_aggregation"] = 0.0
+            stage_latency_ms["step3_explicit_naming"] = 0.0
+            stage_latency_ms["step4_routing"] = 0.0
+            stage_latency_ms["step5_system2_reasoning"] = (time.perf_counter() - t0) * 1000.0
+            sanitized = sanitize_answer(prompt=prompt, answer=raw_answer)
+            total_latency_ms = (time.perf_counter() - start_total) * 1000.0
+            vram_peak_gb = measure_peak_vram_gb()
+            output = {
+                "answer": sanitized.answer,
+                "answer_raw": raw_answer,
+                "sanitization_mode": sanitized.mode,
+                "latency_ms": float(total_latency_ms),
+                "vram_peak_gb": float(vram_peak_gb),
+                "selected_slot_ids": [],
+                "selected_slot_names": [],
+                "router_scores": [],
+            }
+            if return_debug:
+                output["debug"] = {
+                    "stage_latency_ms": {k: float(v) for k, v in stage_latency_ms.items()},
+                    "num_raw_visual_tokens": 0,
+                    "num_dynamic_slots": 0,
+                    "num_selected_slots": 0,
+                    "slot_name_confidence": [],
+                    "bypass_reason": "no_visual_tokens",
+                }
+            return output
 
         # Step 2: Dynamic query-aware slot construction.
         t0 = time.perf_counter()
@@ -177,8 +235,7 @@ class NSSMSystem:
 
         # Step 5: System-2 reasoning with routed slots only.
         t0 = time.perf_counter()
-        generation_cfg = self.config.get("generation", {})
-        answer = self.backend.generate_with_selected_slots(
+        raw_answer = self.backend.generate_with_selected_slots(
             prompt=prompt,
             selected_slots=router_output.selected_slots,
             slot_names=[item.name for item in router_output.selected_metadata],
@@ -187,13 +244,16 @@ class NSSMSystem:
             top_p=float(generation_cfg.get("top_p", 1.0)),
         )
         stage_latency_ms["step5_system2_reasoning"] = (time.perf_counter() - t0) * 1000.0
+        sanitized = sanitize_answer(prompt=prompt, answer=raw_answer)
 
         end_total = time.perf_counter()
         total_latency_ms = (end_total - start_total) * 1000.0
         vram_peak_gb = measure_peak_vram_gb()
 
         output: Dict[str, Any] = {
-            "answer": answer,
+            "answer": sanitized.answer,
+            "answer_raw": raw_answer,
+            "sanitization_mode": sanitized.mode,
             "latency_ms": float(total_latency_ms),
             "vram_peak_gb": float(vram_peak_gb),
             "selected_slot_ids": router_output.indices,
@@ -335,4 +395,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

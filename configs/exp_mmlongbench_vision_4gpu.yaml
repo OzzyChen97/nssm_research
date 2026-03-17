@@ -1,0 +1,37 @@
+experiment_name: "nssm_mmlongbench_vision_4gpu"
+
+model:
+  backend: "qwen"
+  model_name: "Qwen/Qwen2.5-VL-7B-Instruct"
+  model_local_path: "/workspace/helandi/model/Qwen-7b/Qwen2.5-VL-7B-Instruct/"
+  precision: "bfloat16"
+  device_map: "auto"
+  use_flash_attention_2: true
+  torch_compile: true
+  compile_aggregator: true
+  trust_remote_code: true
+
+nssm:
+  max_visual_tokens_raw: 100000
+  num_dynamic_slots: 256
+  router_top_k: 32
+  aggregator_num_heads: 8
+  aggregator_dropout: 0.0
+  slot_naming_mode: "prototype_then_optional_llm"
+  enable_llm_slot_refine: false
+  slot_refine_group_size: 8
+  routing_alpha_text_name: 0.6
+
+hardware:
+  gpus: 4
+  per_device_eval_batch_size: 1
+  seed: 42
+
+generation:
+  max_new_tokens: 256
+  temperature: 0.0
+  top_p: 1.0
+
+runtime:
+  output_file: "/workspace/zhuo/long_visual_context/nssm_research/outputs/nssm_mmlongbench_vision_4gpu.json"
+  save_debug: false

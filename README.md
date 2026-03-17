@@ -10,7 +10,8 @@
 ```text
 nssm_research/
 ├── configs/
-│   └── exp_mmlongbench_128k.yaml
+│   ├── exp_mmlongbench_128k.yaml
+│   └── exp_mmlongbench_vision_4gpu.yaml
 ├── src/
 │   ├── models/
 │   │   ├── __init__.py
@@ -23,9 +24,11 @@ nssm_research/
 │   │   └── inference_engine.py
 │   └── eval/
 │       ├── mmlongbench_loader.py
+│       ├── mmlongbench_report.py
 │       └── metrics.py
 ├── scripts/
-│   └── run_mmlongbench.sh
+│   ├── run_mmlongbench.sh
+│   └── run_mmlongbench_vision_4gpu.sh
 └── requirements.txt
 ```
 
@@ -89,6 +92,80 @@ bash scripts/run_mmlongbench.sh \
 - `vram_peak_gb`：峰值显存
 - `selected_slot_ids / selected_slot_names / router_scores`：NSSM 路由可解释信息
 - `debug.stage_latency_ms`：五阶段细粒度耗时
+
+### 4.4 四卡视觉版 MMLongBench 完整验证
+
+这一条链路只在 `nssm_research/` 下新增脚本与汇总器，不改 `MMLongBench/` 源码；实际评测仍复用官方 `MMLongBench/scripts/eval_task_manager.py` 和 `--use_nssm` 入口。
+
+默认覆盖的视觉任务为：
+
+- `vrag`
+- `vh`
+- `mm_niah_image`
+- `icl`
+- `docqa`
+
+默认测试长度为：
+
+- `8`
+- `16`
+- `32`
+- `64`
+- `128`
+
+推荐直接运行：
+
+```bash
+cd /workspace/zhuo/long_visual_context/nssm_research
+bash scripts/run_mmlongbench_vision_4gpu.sh
+```
+
+该脚本的默认行为：
+
+- 使用 `conda run -n mmlongbench`
+- 使用四张卡 `0,1,2,3`
+- 使用配置 `configs/exp_mmlongbench_vision_4gpu.yaml`
+- 输出目录为 `nssm_research/outputs/mmlongbench_vision_4gpu`
+- `docqa_llm_judge=False`
+
+常用覆盖方式：
+
+```bash
+CONDA_ENV=mmlongbench \
+GPU_LIST=0,1,2,3 \
+MODEL_NAME=/workspace/helandi/model/Qwen-7b/Qwen2.5-VL-7B-Instruct/ \
+RESULT_BASE_PATH=/workspace/zhuo/long_visual_context/nssm_research/outputs/mmlongbench_vision_4gpu \
+bash scripts/run_mmlongbench_vision_4gpu.sh --overwrite
+```
+
+注意：
+
+- 脚本会先切换到同级 `MMLongBench/` 目录，再调用官方 `eval_task_manager.py`，这是为了兼容其内部对 `eval.py` 的相对路径调用。
+- `docqa` 默认关闭 LLM judge，因此不需要额外 API key；对应结果按本地官方非 LLM 指标汇总。
+- `eval_task_manager.py` 会在结果目录下自动创建以模型名为后缀的子目录，例如 `Qwen2.5-VL-7B-Instruct/`。
+
+### 4.5 结果汇总与实验总结
+
+四卡实验结束后，使用下面的命令生成 `summary.json` 和 `summary.md`：
+
+```bash
+cd /workspace/zhuo/long_visual_context/nssm_research
+conda run -n mmlongbench python -m src.eval.mmlongbench_report \
+  --result_dir /workspace/zhuo/long_visual_context/nssm_research/outputs/mmlongbench_vision_4gpu/Qwen2.5-VL-7B-Instruct \
+  --output_dir /workspace/zhuo/long_visual_context/nssm_research/outputs/mmlongbench_vision_4gpu/report
+```
+
+汇总结果会包含：
+
+- 总体完成度检查：哪些任务或长度缺失
+- 分任务、分长度的统一 `score_pct`
+- 代表性错误样例
+- 面向 NSSM 的改进建议
+
+输出文件：
+
+- `summary.json`：机器可读
+- `summary.md`：人工阅读版实验总结
 
 ## 5. 核心配置说明
 
@@ -166,7 +243,20 @@ python -m pip install -r requirements.txt
 - `nssm.num_dynamic_slots`（例如 256 -> 128）
 - `nssm.router_top_k`（例如 32 -> 16）
 
+### Q4: 四卡脚本跑完后，汇总器提示有缺失任务
+
+先检查对应目录：
+
+- `outputs/mmlongbench_vision_4gpu/<model_tag>/<task>_<length>/error.log`
+- `outputs/mmlongbench_vision_4gpu/<model_tag>/<task>_<length>/stdout.log`
+
+再重新跑：
+
+```bash
+cd /workspace/zhuo/long_visual_context/nssm_research
+bash scripts/run_mmlongbench_vision_4gpu.sh --overwrite
+```
+
 ---
 
 如果你下一步要做“可训练版 NSSM（如 LoRA 微调聚合器）”，建议先在当前推理骨架上新增训练脚本，而不是改动现有推理主干，保证论文复现实验稳定性。
-
